@@ -56,6 +56,7 @@ module Network.TLS.Context.Internal
     , getHState
     , getStateRNG
     , tls13orLater
+    , ctxIsDTLS
     ) where
 
 import Network.TLS.Backend
@@ -71,6 +72,7 @@ import Network.TLS.Record.State
 import Network.TLS.Parameters
 import Network.TLS.Measurement
 import Network.TLS.Imports
+import Network.TLS.Record
 import qualified Data.ByteString as B
 
 import Control.Concurrent.MVar
@@ -78,7 +80,6 @@ import Control.Monad.State.Strict
 import Control.Exception (throwIO, Exception())
 import Data.IORef
 import Data.Tuple
-
 
 -- | Information related to a running context, e.g. current cipher
 data Information = Information
@@ -118,6 +119,13 @@ data Context = Context
                                            -- it is usually nested in a write or read lock.
     , ctxPendingActions   :: IORef [PendingAction]
     , ctxKeyLogger        :: String -> IO ()
+
+    -- DTLS related
+    , ctxMTU              :: Word16        -- DTLS fragment size
+    , ctxHelloCookieGen   :: IO HelloCookie
+    , ctxHelloCookieVerify:: HelloCookie -> IO Bool
+    , ctxNextHsMsgSeq     :: Word16 -> IO [Word16] -- generator for next handshake messages' DTLS sequence numbers
+    , ctxRecordCache      :: Maybe (Record Plaintext) -> IO (Maybe (Record Plaintext))
     }
 
 data Established = NotEstablished
@@ -270,3 +278,7 @@ tls13orLater ctx = do
     return $ case ev of
                Left  _ -> False
                Right v -> v >= TLS13
+
+ctxIsDTLS :: Context -> Bool
+ctxIsDTLS ctx = DTLS12 `elem` vers || DTLS10 `elem` vers
+  where vers = supportedVersions $ ctxSupported ctx

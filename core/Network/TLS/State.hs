@@ -19,9 +19,7 @@ module Network.TLS.State
     , newTLSState
     , withTLSRNG
     , updateVerifiedData
-    , finishHandshakeTypeMaterial
     , finishHandshakeMaterial
-    , certVerifyHandshakeTypeMaterial
     , certVerifyHandshakeMaterial
     , setVersion
     , setVersionIfUnset
@@ -59,6 +57,9 @@ module Network.TLS.State
     -- * random
     , genRandom
     , withRNG
+    , setHelloCookie
+    , getHelloCookie
+    , clearHelloCookie
     ) where
 
 import Network.TLS.Imports
@@ -81,7 +82,13 @@ data TLSState = TLSState
     , stClientVerifiedData  :: ByteString -- RFC 5746
     , stServerVerifiedData  :: ByteString -- RFC 5746
     , stExtensionALPN       :: Bool  -- RFC 7301
-    , stHandshakeRecordCont :: Maybe (GetContinuation (HandshakeType, ByteString))
+    , stHandshakeRecordCont :: Maybe (GetContinuation (HandshakeType, -- type of handshake message
+                                                       Handshake -> Handshake, -- decorator to be applied
+                                                       -- after message is parsed (dtls-related,
+                                                       -- since message body does not contain DTLS message
+                                                       -- sequence number which should be preserved to
+                                                       -- correctly compute the FINISHED digest)
+                                                       ByteString)) -- message body
     , stNegotiatedProtocol  :: Maybe B.ByteString -- ALPN protocol
     , stHandshakeRecordCont13 :: Maybe (GetContinuation (HandshakeType13, ByteString))
     , stClientALPNSuggest   :: Maybe [B.ByteString]
@@ -97,6 +104,8 @@ data TLSState = TLSState
     , stTLS13HRR            :: !Bool
     , stTLS13Cookie         :: Maybe Cookie
     , stExporterMasterSecret :: Maybe ByteString -- TLS 1.3
+    -- DTLS related
+    , stHelloCookie         :: !(Maybe HelloCookie)
     }
 
 newtype TLSSt a = TLSSt { runTLSSt :: ErrT TLSError (State TLSState) a }
@@ -136,6 +145,7 @@ newTLSState rng clientContext = TLSState
     , stTLS13HRR            = False
     , stTLS13Cookie         = Nothing
     , stExporterMasterSecret = Nothing
+    , stHelloCookie         = Nothing
     }
 
 updateVerifiedData :: Role -> ByteString -> TLSSt ()
@@ -147,6 +157,7 @@ updateVerifiedData sending bs = do
 
 finishHandshakeTypeMaterial :: HandshakeType -> Bool
 finishHandshakeTypeMaterial HandshakeType_ClientHello     = True
+finishHandshakeTypeMaterial HandshakeType_HelloVerifyRequest = False
 finishHandshakeTypeMaterial HandshakeType_ServerHello     = True
 finishHandshakeTypeMaterial HandshakeType_Certificate     = True
 finishHandshakeTypeMaterial HandshakeType_HelloRequest    = False
@@ -158,10 +169,16 @@ finishHandshakeTypeMaterial HandshakeType_CertVerify      = True
 finishHandshakeTypeMaterial HandshakeType_Finished        = True
 
 finishHandshakeMaterial :: Handshake -> Bool
-finishHandshakeMaterial = finishHandshakeTypeMaterial . typeOfHandshake
+-- https://tools.ietf.org/html/rfc6347#section-4.2.6 "initial
+-- ClientHello and HelloVerifyRequest MUST NOT be included in the
+-- CertificateVerify or Finished MAC computations."
+finishHandshakeMaterial (ClientHello ver _ _ (HelloCookie cookie) _ _ _ _) =
+  if isDTLS ver && B.null cookie then False else True
+finishHandshakeMaterial x = finishHandshakeTypeMaterial $ typeOfHandshake x
 
 certVerifyHandshakeTypeMaterial :: HandshakeType -> Bool
 certVerifyHandshakeTypeMaterial HandshakeType_ClientHello     = True
+certVerifyHandshakeTypeMaterial HandshakeType_HelloVerifyRequest = False
 certVerifyHandshakeTypeMaterial HandshakeType_ServerHello     = True
 certVerifyHandshakeTypeMaterial HandshakeType_Certificate     = True
 certVerifyHandshakeTypeMaterial HandshakeType_HelloRequest    = False
@@ -173,7 +190,10 @@ certVerifyHandshakeTypeMaterial HandshakeType_CertVerify      = False
 certVerifyHandshakeTypeMaterial HandshakeType_Finished        = False
 
 certVerifyHandshakeMaterial :: Handshake -> Bool
-certVerifyHandshakeMaterial = certVerifyHandshakeTypeMaterial . typeOfHandshake
+-- https://tools.ietf.org/html/rfc6347#section-4.2.6, see comment above
+certVerifyHandshakeMaterial (ClientHello ver _ _ (HelloCookie cookie) _ _ _ _) =
+  if isDTLS ver && B.null cookie then False else True
+certVerifyHandshakeMaterial x = certVerifyHandshakeTypeMaterial $ typeOfHandshake x
 
 setSession :: Session -> Bool -> TLSSt ()
 setSession session resuming = modify (\st -> st { stSession = session, stSessionResuming = resuming })
@@ -287,3 +307,12 @@ setTLS13Cookie mcookie = modify (\st -> st { stTLS13Cookie = mcookie })
 
 getTLS13Cookie :: TLSSt (Maybe Cookie)
 getTLS13Cookie = gets stTLS13Cookie
+
+setHelloCookie :: HelloCookie -> TLSSt ()
+setHelloCookie cookie = modify $ \st -> st { stHelloCookie = Just cookie }
+
+getHelloCookie :: TLSSt (Maybe HelloCookie)
+getHelloCookie = gets stHelloCookie
+
+clearHelloCookie :: TLSSt ()
+clearHelloCookie = modify $ \st -> st { stHelloCookie = Nothing }

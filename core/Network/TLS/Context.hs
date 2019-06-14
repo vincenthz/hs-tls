@@ -62,10 +62,12 @@ module Network.TLS.Context
     , getHState
     , getStateRNG
     , tls13orLater
+    , ctxIsDTLS
     ) where
 
 import Network.TLS.Backend
 import Network.TLS.Context.Internal
+import Network.TLS.Context.Window
 import Network.TLS.Struct
 import Network.TLS.State
 import Network.TLS.Hooks
@@ -79,7 +81,17 @@ import Network.TLS.RNG
 
 import Control.Concurrent.MVar
 import Control.Monad.State.Strict
+
 import Data.IORef
+import Crypto.Random
+import Time.System
+import Time.Types
+import Data.Serialize
+import Data.Tuple(swap)
+import qualified Crypto.MAC.HMAC as HMAC
+import Crypto.Hash.Algorithms(MD5)
+import qualified Data.ByteString as B
+import qualified Data.ByteArray as BA
 
 -- deprecated imports
 #ifdef INCLUDE_NETWORK
@@ -137,7 +149,9 @@ contextNew backend params = liftIO $ do
     stats <- newIORef newMeasurement
     -- we enable the reception of SSLv2 ClientHello message only in the
     -- server context, where we might be dealing with an old/compat client.
-    sslv2Compat <- newIORef (role == ServerRole)
+    let versions = supportedVersions supported
+        dtls = DTLS12 `elem` versions || DTLS10 `elem` versions
+    sslv2Compat <- newIORef (role == ServerRole && not dtls)
     needEmptyPacket <- newIORef False
     hooks <- newIORef defaultHooks
     tx    <- newMVar newRecordState
@@ -147,6 +161,9 @@ contextNew backend params = liftIO $ do
     lockWrite <- newMVar ()
     lockRead  <- newMVar ()
     lockState <- newMVar ()
+    (cookieGen, cookieVerify) <- makeHelloCookieMethods
+    hsMsgSeq <- newIORef 0
+    recWindow <- newIORef newWindow
 
     return Context
             { ctxConnection   = getBackend backend
@@ -169,6 +186,11 @@ contextNew backend params = liftIO $ do
             , ctxLockState        = lockState
             , ctxPendingActions   = as
             , ctxKeyLogger        = debugKeyLogger debug
+            , ctxMTU              = 1024
+            , ctxHelloCookieGen   = cookieGen
+            , ctxHelloCookieVerify= cookieVerify
+            , ctxNextHsMsgSeq     = \count -> atomicModifyIORef' hsMsgSeq (\sn -> (sn+count, [sn..sn+count-1]))
+            , ctxRecordCache      = maybeCacheMaybeGetNext recWindow
             }
 
 -- | create a new context on an handle.
@@ -200,3 +222,40 @@ contextHookSetCertificateRecv context f =
 contextHookSetLogging :: Context -> Logging -> IO ()
 contextHookSetLogging context loggingCallbacks =
     contextModifyHooks context (\hooks -> hooks { hookLogging = loggingCallbacks })
+
+
+makeHelloCookieMethods :: IO (IO HelloCookie, HelloCookie -> IO Bool)
+-- Returns two methods -- one to generate and other to verify a cookie that is
+-- to be placed in HelloVerifyRequest hanshake message.
+-- This implementation suffers from the fact that we don't have the information
+-- on peer IP address here, so we cannot be sure each peer uses only its own cookie.
+-- 
+-- So there'll be just a time window of cOOKIE_EXPIRATION_TIMEOUT
+-- during which cookies are valid. And of course a random salt in each cookie, but
+-- no binding of a cookie with the peer for whom it was generated.
+makeHelloCookieMethods = do
+    let cOOKIE_EXPIRATION_TIMEOUT = 4 -- seconds
+    rng <- getSystemDRG >>= newIORef
+    let mkrandom :: Int -> IO B.ByteString
+        mkrandom bytes = atomicModifyIORef' rng $ swap . randomBytesGenerate bytes
+    secret <- mkrandom 16
+    let generate = do
+          (Elapsed (Seconds ts)) <- timeCurrent
+          let tsbs = encode ts
+          salt <- mkrandom 8
+          let mac :: HMAC.HMAC MD5
+              mac = HMAC.hmac secret $ salt `mappend` tsbs
+          return $ HelloCookie $ salt `mappend` tsbs `mappend` (BA.convert $ HMAC.hmacGetDigest mac)
+        verify (HelloCookie cbs) = do
+          (Elapsed (Seconds ts')) <- timeCurrent
+          let (salt, r) = B.splitAt 8 cbs
+              (tsbs, mac') = B.splitAt 8 r
+              ets = decode tsbs
+              mac :: HMAC.HMAC MD5
+              mac = HMAC.hmac secret $ salt `mappend` tsbs
+              macVerified = (BA.convert mac) == mac'
+          case ets of
+            Left _ -> return False
+            Right ts -> return $ macVerified &&
+                        (abs (ts - ts') <= cOOKIE_EXPIRATION_TIMEOUT)
+    return (generate, verify)

@@ -1,3 +1,4 @@
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- Disable this warning so we can still test deprecated functionality.
 {-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
@@ -12,6 +13,7 @@ import Data.Default.Class
 import Data.X509.CertificateStore
 import Network.Socket (socket, close, bind, listen, accept)
 import qualified Network.Socket as S
+import Network.Socket.ByteString(recvFrom)
 import Network.TLS.SessionManager
 import System.Console.GetOpt
 import System.Environment
@@ -116,9 +118,11 @@ getDefaultParams flags store smgr cred rtt0accept = do
                 | Tls11 `elem` flags = TLS11
                 | Ssl3  `elem` flags = SSL3
                 | Tls10 `elem` flags = TLS10
+                | Dtls  `elem` flags = DTLS12
                 | otherwise          = TLS12
             supportedVers
                 | NoVersionDowngrade `elem` flags = [tlsConnectVer]
+                | Dtls `elem` flags = [DTLS10, DTLS12]
                 | otherwise = filter (<= tlsConnectVer) allVers
             allVers = [SSL3, TLS10, TLS11, TLS12, TLS13]
             validateCert = not (NoValidateCert `elem` flags)
@@ -135,7 +139,7 @@ getGroups flags = case getGroup >>= readGroups of
             f acc _          = acc
 
 data Flag = Verbose | Debug | IODebug | NoValidateCert | Http11
-          | Ssl3 | Tls10 | Tls11 | Tls12 | Tls13
+          | Ssl3 | Tls10 | Tls11 | Tls12 | Tls13 | Dtls
           | NoVersionDowngrade
           | AllowRenegotiation
           | Output String
@@ -176,6 +180,7 @@ options =
     , Option []     ["tls11"]   (NoArg Tls11) "use TLS 1.1"
     , Option []     ["tls12"]   (NoArg Tls12) "use TLS 1.2 (default)"
     , Option []     ["tls13"]   (NoArg Tls13) "use TLS 1.3"
+    , Option []     ["dtls"]    (NoArg Dtls)  "use DTLS 1.2"
     , Option []     ["bogocipher"] (ReqArg BogusCipher "cipher-id") "add a bogus cipher id for testing"
     , Option ['x']  ["no-version-downgrade"] (NoArg NoVersionDowngrade) "do not allow version downgrade"
     , Option []     ["allow-renegotiation"] (NoArg AllowRenegotiation) "allow client-initiated renegotiation"
@@ -205,12 +210,14 @@ loadCred _       Nothing =
     error "missing credential certificate"
 
 runOn (sStorage, certStore) flags port = do
-    ai <- makeAddrInfo Nothing port
+    let dtls = Dtls `elem` flags
+    ai <- makeAddrInfo dtls Nothing port
     sock <- socket (addrFamily ai) (addrSocketType ai) (addrProtocol ai)
     S.setSocketOption sock S.ReuseAddr 1
     let sockaddr = addrAddress ai
     bind sock sockaddr
-    listen sock 10
+    when (not dtls) $ do
+        listen sock 10
     runOn' sock
     close sock
   where
@@ -249,17 +256,28 @@ runOn (sStorage, certStore) flags port = do
                     loopRecvData (bytes - B.length d) ctx
 
         doTLS sock out = do
-            (cSock, cAddr) <- accept sock
+            let dtls = Dtls `elem` flags
+            (cSock, cAddr, firstDgram) <- if (not dtls)
+                                          then do (sock', addr) <- accept sock
+                                                  return (sock', addr, B.empty)
+                                          else do (firstDgram, addr) <- recvFrom sock 65535
+                                                  return (sock, addr, firstDgram)
             putStrLn ("connection from " ++ show cAddr)
 
             cred <- loadCred getKey getCertificate
             let rtt0accept = Rtt0 `elem` flags
             params <- getDefaultParams flags certStore sStorage cred rtt0accept
+            backend <- if not dtls
+                       then do initializeBackend cSock
+                               return $ getBackend cSock
+                       else do makeDgramSocketBackend [firstDgram] cSock cAddr
 
-            void $ forkIO $ do
+            let runConnection conn = if dtls then conn else void (forkIO conn)
+
+            runConnection $ do
                 runTLS (Debug `elem` flags)
                        (IODebug `elem` flags)
-                       params cSock $ \ctx -> do
+                       params backend $ \ctx -> do
                     handshake ctx
                     when (Verbose `elem` flags) $ printHandshakeInfo ctx
                     loopRecv out ctx
@@ -267,7 +285,7 @@ runOn (sStorage, certStore) flags port = do
                     bye ctx
                     return ()
                 close cSock
-            doTLS sock out
+            when (not dtls) $ doTLS sock out
 
         loopRecv out ctx = do
             d <- timeout (timeoutMs * 1000) (recvData ctx) -- 2s per recv
@@ -319,6 +337,7 @@ printUsage =
     putStrLn $ usageInfo "usage: simpleserver [opts] [port]\n\n\t(port default to: 443)\noptions:\n" options
 
 main = do
+    hSetBuffering stdout LineBuffering
     args <- getArgs
     let (opts,other,errs) = getOpt Permute options args
     when (not $ null errs) $ do

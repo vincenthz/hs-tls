@@ -40,9 +40,11 @@ module Network.TLS.Struct
     , ServerKeyXchgAlgorithmData(..)
     , ClientKeyXchgAlgorithmData(..)
     , Packet(..)
+    , SequenceNumber
     , Header(..)
     , ServerRandom(..)
     , ClientRandom(..)
+    , HelloCookie(..)
     , FinishedData
     , SessionID
     , Session(..)
@@ -53,11 +55,13 @@ module Network.TLS.Struct
     , Handshake(..)
     , numericalVer
     , verOfNum
+    , isDTLS
     , TypeValuable, valOfType, valToType
     , EnumSafe8(..)
     , EnumSafe16(..)
     , packetType
     , typeOfHandshake
+    , unDtlsHandshake
     ) where
 
 import Data.X509 (CertificateChain, DistinguishedName)
@@ -201,11 +205,18 @@ data Packet =
     | AppData ByteString
     deriving (Show,Eq)
 
-data Header = Header ProtocolType Version Word16 deriving (Show,Eq)
+type SequenceNumber = Word64
+-- ^ Record sequence number for DTLS. Not used in non-dtls protocols.
+--   Actually that's 16 (most signigicant) bits of epoch
+--   and 48 (least significant) bits of sequence number
+
+data Header = Header ProtocolType Version SequenceNumber Word16 deriving (Show,Eq)
 
 newtype ServerRandom = ServerRandom { unServerRandom :: ByteString } deriving (Show, Eq)
 newtype ClientRandom = ClientRandom { unClientRandom :: ByteString } deriving (Show, Eq)
 newtype Session = Session (Maybe SessionID) deriving (Show, Eq)
+
+newtype HelloCookie = HelloCookie ByteString deriving (Show, Eq)
 
 type FinishedData = ByteString
 type ExtensionID  = Word16
@@ -259,6 +270,7 @@ data AlertDescription =
 data HandshakeType =
       HandshakeType_HelloRequest
     | HandshakeType_ClientHello
+    | HandshakeType_HelloVerifyRequest
     | HandshakeType_ServerHello
     | HandshakeType_Certificate
     | HandshakeType_ServerKeyXchg
@@ -329,7 +341,8 @@ data ClientKeyXchgAlgorithmData =
 type DeprecatedRecord = ByteString
 
 data Handshake =
-      ClientHello !Version !ClientRandom !Session ![CipherID] ![CompressionID] [ExtensionRaw] (Maybe DeprecatedRecord)
+      ClientHello !Version !ClientRandom !Session !HelloCookie ![CipherID] ![CompressionID] [ExtensionRaw] (Maybe DeprecatedRecord)
+    | HelloVerifyRequest !Version !HelloCookie
     | ServerHello !Version !ServerRandom !Session !CipherID !CompressionID [ExtensionRaw]
     | Certificates CertificateChain
     | HelloRequest
@@ -339,6 +352,8 @@ data Handshake =
     | CertRequest [CertificateType] (Maybe [HashAndSignatureAlgorithm]) [DistinguishedName]
     | CertVerify DigitallySigned
     | Finished FinishedData
+
+    | DtlsHandshake Word16 Handshake -- handshake message sequence number, then the message itself
     deriving (Show,Eq)
 
 packetType :: Packet -> ProtocolType
@@ -349,6 +364,7 @@ packetType (AppData _)      = ProtocolType_AppData
 
 typeOfHandshake :: Handshake -> HandshakeType
 typeOfHandshake ClientHello{}             = HandshakeType_ClientHello
+typeOfHandshake HelloVerifyRequest{}      = HandshakeType_HelloVerifyRequest
 typeOfHandshake ServerHello{}             = HandshakeType_ServerHello
 typeOfHandshake Certificates{}            = HandshakeType_Certificate
 typeOfHandshake HelloRequest              = HandshakeType_HelloRequest
@@ -358,6 +374,11 @@ typeOfHandshake ServerKeyXchg{}           = HandshakeType_ServerKeyXchg
 typeOfHandshake CertRequest{}             = HandshakeType_CertRequest
 typeOfHandshake CertVerify{}              = HandshakeType_CertVerify
 typeOfHandshake Finished{}                = HandshakeType_Finished
+typeOfHandshake (DtlsHandshake _ hs)      = typeOfHandshake hs
+
+unDtlsHandshake :: Handshake -> Handshake
+unDtlsHandshake (DtlsHandshake _ hs) = hs
+unDtlsHandshake hs = hs
 
 numericalVer :: Version -> (Word8, Word8)
 numericalVer SSL2  = (2, 0)
@@ -366,6 +387,8 @@ numericalVer TLS10 = (3, 1)
 numericalVer TLS11 = (3, 2)
 numericalVer TLS12 = (3, 3)
 numericalVer TLS13 = (3, 4)
+numericalVer DTLS10 = (254, 255)
+numericalVer DTLS12 = (254, 253)
 
 verOfNum :: (Word8, Word8) -> Maybe Version
 verOfNum (2, 0) = Just SSL2
@@ -374,7 +397,14 @@ verOfNum (3, 1) = Just TLS10
 verOfNum (3, 2) = Just TLS11
 verOfNum (3, 3) = Just TLS12
 verOfNum (3, 4) = Just TLS13
+verOfNum (254,255) = Just DTLS10
+verOfNum (254,253) = Just DTLS12
 verOfNum _      = Nothing
+
+isDTLS :: Version -> Bool
+isDTLS DTLS10 = True
+isDTLS DTLS12 = True
+isDTLS _ = False
 
 class TypeValuable a where
     valOfType :: a -> Word8
@@ -424,6 +454,7 @@ instance TypeValuable HandshakeType where
     valOfType HandshakeType_HelloRequest    = 0
     valOfType HandshakeType_ClientHello     = 1
     valOfType HandshakeType_ServerHello     = 2
+    valOfType HandshakeType_HelloVerifyRequest = 3
     valOfType HandshakeType_Certificate     = 11
     valOfType HandshakeType_ServerKeyXchg   = 12
     valOfType HandshakeType_CertRequest     = 13
@@ -435,6 +466,7 @@ instance TypeValuable HandshakeType where
     valToType 0  = Just HandshakeType_HelloRequest
     valToType 1  = Just HandshakeType_ClientHello
     valToType 2  = Just HandshakeType_ServerHello
+    valToType 3  = Just HandshakeType_HelloVerifyRequest
     valToType 11 = Just HandshakeType_Certificate
     valToType 12 = Just HandshakeType_ServerKeyXchg
     valToType 13 = Just HandshakeType_CertRequest

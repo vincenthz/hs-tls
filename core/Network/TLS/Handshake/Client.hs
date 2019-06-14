@@ -77,6 +77,10 @@ handshakeClient' cparams ctx groups mcrand = do
     sentExtensions <- sendClientHello mcrand
     recvServerHello sentExtensions
     ver <- usingState_ ctx getVersion
+    helloCookie <- usingState_ ctx getHelloCookie 
+    if isDTLS ver && Nothing /= helloCookie
+      then handshakeClient' cparams ctx groups mcrand -- just restart with requested hello cookie set
+      else do
     -- recvServerHello sets TLS13HRR according to the server random.
     -- For 1st server hello, getTLS13HR returns True if it is HRR and False otherwise.
     -- For 2nd server hello, getTLS13HR returns False since it is NOT HRR.
@@ -234,6 +238,7 @@ handshakeClient' cparams ctx groups mcrand = do
                       return exts'
 
         sendClientHello mcr = do
+            mcookie <- usingState_ ctx getHelloCookie
             crand <- clientRandom ctx mcr
             let ver = if tls13 then TLS12 else highestVer
             hrr <- usingState_ ctx getTLS13HRR
@@ -241,7 +246,8 @@ handshakeClient' cparams ctx groups mcrand = do
             usingState_ ctx $ setVersionIfUnset highestVer
             let cipherIds = map cipherID ciphers
                 compIds = map compressionID compressions
-                mkClientHello exts = ClientHello ver crand clientSession cipherIds compIds exts Nothing
+                cookie = maybe (HelloCookie B.empty) id mcookie
+                mkClientHello exts = ClientHello ver crand clientSession cookie cipherIds compIds exts Nothing
             extensions0 <- catMaybes <$> getExtensions
             extensions <- adjustExtentions extensions0 $ mkClientHello extensions0
             sendPacket ctx $ Handshake [mkClientHello extensions]
@@ -272,7 +278,7 @@ handshakeClient' cparams ctx groups mcrand = do
         recvServerHello sentExts = runRecvState ctx recvState
           where recvState = RecvStateNext $ \p ->
                     case p of
-                        Handshake hs -> onRecvStateHandshake ctx (RecvStateHandshake $ onServerHello ctx cparams sentExts) hs -- this adds SH to hstHandshakeMessages
+                        Handshake hs -> onRecvStateHandshake ctx (RecvStateHandshake $ onServerHello ctx cparams sentExts . unDtlsHandshake) hs -- this adds SH to hstHandshakeMessages
                         Alert a      ->
                             case a of
                                 [(AlertLevel_Warning, UnrecognizedName)] ->
@@ -542,10 +548,11 @@ sendClientData cparams ctx = sendCertificate >> sendClientKeyXchg >> sendCertifi
             -- have sent a non-empty list of certificates.
             --
             certSent <- usingHState ctx getClientCertSent
+            let isXTLS12 = ver `elem` [TLS12, DTLS12]
             when certSent $ do
                 keyAlg      <- getLocalDigitalSignatureAlg ctx
-                mhashSig    <- case ver of
-                    TLS12 ->
+                mhashSig    <- case isXTLS12 of
+                    True ->
                         let cHashSigs = supportedHashSignatures $ ctxSupported ctx
                          in Just <$> getLocalHashSigAlg ctx cHashSigs keyAlg
                     _     -> return Nothing
@@ -610,6 +617,7 @@ onServerHello ctx cparams sentExts (ServerHello rver serverRan serverSession cip
                 Nothing                       -> Nothing
         isHRR = isHelloRetryRequest serverRan
     usingState_ ctx $ do
+        clearHelloCookie -- so that we do not restart handshake
         setTLS13HRR isHRR
         setTLS13Cookie (guard isHRR >> extensionLookup extensionID_Cookie exts >>= extensionDecode MsgTServerHello)
         setSession serverSession (isJust resumingSession)
@@ -634,19 +642,26 @@ onServerHello ctx cparams sentExts (ServerHello rver serverRan serverSession cip
     case find (== ver) (supportedVersions $ ctxSupported ctx) of
         Nothing -> throwCore $ Error_Protocol ("server version " ++ show ver ++ " is not supported", True, ProtocolVersion)
         Just _  -> return ()
-    if ver > TLS12 then do
+    if (ver >= TLS13) then do
         ensureNullCompression compression
         usingHState ctx $ setHelloParameters13 cipherAlg
         return RecvStateDone
       else do
         usingHState ctx $ setServerHelloParameters rver serverRan cipherAlg compressAlg
         case resumingSession of
-            Nothing          -> return $ RecvStateHandshake (processCertificate cparams ctx)
+            Nothing          -> return $ RecvStateHandshake (processCertificate cparams ctx . unDtlsHandshake)
             Just sessionData -> do
                 let masterSecret = sessionSecret sessionData
                 usingHState ctx $ setMasterSecret rver ClientRole masterSecret
                 logKey ctx (MasterSecret masterSecret)
                 return $ RecvStateNext expectChangeCipher
+onServerHello ctx _ _ (HelloVerifyRequest _ cookie) = do
+    usingState_ ctx $ do
+      mcookie <- getHelloCookie
+      case mcookie of
+        Nothing -> setHelloCookie cookie
+        _ -> fail "refusing to go for a second attempt of HelloVerifyRequest"
+    return RecvStateDone
 onServerHello _ _ _ p = unexpected (show p) (Just "server hello")
 
 processCertificate :: ClientParams -> Context -> Handshake -> IO (RecvState IO)
@@ -658,7 +673,7 @@ processCertificate cparams ctx (Certificates certs) = do
     case usage of
         CertificateUsageAccept        -> checkLeafCertificateKeyUsage
         CertificateUsageReject reason -> certificateRejected reason
-    return $ RecvStateHandshake (processServerKeyExchange ctx)
+    return $ RecvStateHandshake (processServerKeyExchange ctx . unDtlsHandshake)
   where shared = clientShared cparams
         checkCert = onServerCertificate (clientHooks cparams) (sharedCAStore shared)
                                                               (sharedValidationCache shared)
@@ -680,7 +695,7 @@ processCertificate cparams ctx (Certificates certs) = do
 processCertificate _ ctx p = processServerKeyExchange ctx p
 
 expectChangeCipher :: Packet -> IO (RecvState IO)
-expectChangeCipher ChangeCipherSpec = return $ RecvStateHandshake expectFinish
+expectChangeCipher ChangeCipherSpec = return $ RecvStateHandshake $ expectFinish . unDtlsHandshake
 expectChangeCipher p                = unexpected (show p) (Just "change cipher")
 
 expectFinish :: Handshake -> IO (RecvState IO)
@@ -691,7 +706,7 @@ processServerKeyExchange :: Context -> Handshake -> IO (RecvState IO)
 processServerKeyExchange ctx (ServerKeyXchg origSkx) = do
     cipher <- usingHState ctx getPendingCipher
     processWithCipher cipher origSkx
-    return $ RecvStateHandshake (processCertificateRequest ctx)
+    return $ RecvStateHandshake (processCertificateRequest ctx . unDtlsHandshake)
   where processWithCipher cipher skx =
             case (cipherKeyExchange cipher, skx) of
                 (CipherKeyExchange_DHE_RSA, SKX_DHE_RSA dhparams signature) ->
@@ -738,7 +753,8 @@ processServerKeyExchange ctx p = processCertificateRequest ctx p
 processCertificateRequest :: Context -> Handshake -> IO (RecvState IO)
 processCertificateRequest ctx (CertRequest cTypesSent sigAlgs dNames) = do
     ver <- usingState_ ctx getVersion
-    when (ver == TLS12 && isNothing sigAlgs) $
+    let isXTLS12 = ver `elem` [TLS12, DTLS12]
+    when (isXTLS12 && isNothing sigAlgs) $
         throwCore $ Error_Protocol
             ( "missing TLS 1.2 certificate request signature algorithms"
             , True
@@ -746,7 +762,7 @@ processCertificateRequest ctx (CertRequest cTypesSent sigAlgs dNames) = do
             )
     let cTypes = filter (<= lastSupportedCertificateType) cTypesSent
     usingHState ctx $ setCertReqCBdata $ Just (cTypes, sigAlgs, dNames)
-    return $ RecvStateHandshake (processServerHelloDone ctx)
+    return $ RecvStateHandshake (processServerHelloDone ctx . unDtlsHandshake)
 processCertificateRequest ctx p = do
     usingHState ctx $ setCertReqCBdata Nothing
     processServerHelloDone ctx p

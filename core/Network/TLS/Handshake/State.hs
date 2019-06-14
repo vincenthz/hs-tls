@@ -447,12 +447,16 @@ computeKeyBlock hst masterSecret ver cc = (pendingTx, pendingRx)
                   , stMacState    = if cc == ClientRole then msClient else msServer
                   , stCipher      = Just cipher
                   , stCompression = hstPendingCompression hst
+                  , stSeqNumber   = 0xffffffffffffffff
+                  -- this value is never used. it is replaced with correct one in switchTxEncryption
                   }
         pendingRx = RecordState
                   { stCryptState  = if cc == ClientRole then cstServer else cstClient
                   , stMacState    = if cc == ClientRole then msServer else msClient
                   , stCipher      = Just cipher
                   , stCompression = hstPendingCompression hst
+                  , stSeqNumber   = 0xffffffffffffffff
+                  -- this value is never used. it is replaced with correct one in switchRxEncryption
                   }
 
         orOnServer f g = if cc == ClientRole then f else g

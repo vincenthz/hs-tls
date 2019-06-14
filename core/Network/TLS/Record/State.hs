@@ -22,6 +22,10 @@ module Network.TLS.Record.State
     , makeDigest
     , getBulk
     , getMacSequence
+    , getNextSeqNumber
+    , incrSeqNumber
+    , incrEpoch
+    , nextEpoch
     ) where
 
 import Control.Monad.State.Strict
@@ -55,6 +59,7 @@ data RecordState = RecordState
     , stCompression :: Compression
     , stCryptState  :: !CryptState
     , stMacState    :: !MacState
+    , stSeqNumber   :: !SequenceNumber -- ^ DTLS next record sequence number
     } deriving (Show)
 
 newtype RecordM a = RecordM { runRecordM :: Version
@@ -101,11 +106,36 @@ newRecordState = RecordState
     , stCompression = nullCompression
     , stCryptState  = CryptState BulkStateUninitialized B.empty B.empty
     , stMacState    = MacState 0
+    , stSeqNumber   = 0
     }
 
 incrRecordState :: RecordState -> RecordState
 incrRecordState ts = ts { stMacState = MacState (ms + 1) }
   where (MacState ms) = stMacState ts
+
+incrSeqNumber :: RecordM SequenceNumber
+incrSeqNumber = RecordM $ \ver rs ->
+  if not $ isDTLS ver
+  then Right (0, rs)
+  else let sn = stSeqNumber rs
+           wraparound = (sn .&. 0x0000ffffffffffff) == 0x0000ffffffffffff
+       in if wraparound
+          then Left $ Error_Misc "Record sequence number wraparound not permitted"
+          else Right $ (sn, rs { stSeqNumber = sn+1 })
+
+getNextSeqNumber :: RecordM SequenceNumber
+getNextSeqNumber = gets stSeqNumber
+
+nextEpoch :: SequenceNumber -> SequenceNumber
+nextEpoch sn = let prevEpoch = sn .&. 0xffff000000000000
+                   oneEpoch = 0x0001000000000000
+               in prevEpoch+oneEpoch
+
+incrEpoch :: RecordM ()
+incrEpoch =  RecordM $ \ver rs ->
+  if not $ isDTLS ver
+  then Right ((), rs)
+  else Right $ ((), rs { stSeqNumber = nextEpoch $ stSeqNumber rs })
 
 setRecordIV :: ByteString -> RecordState -> RecordState
 setRecordIV iv st = st { stCryptState = (stCryptState st) { cstIV = iv } }
@@ -123,11 +153,12 @@ computeDigest ver tstate hdr content = (digest, incrRecordState tstate)
         cst    = stCryptState tstate
         cipher = fromJust "cipher" $ stCipher tstate
         hashA  = cipherHash cipher
-        encodedSeq = encodeWord64 $ msSequence $ stMacState tstate
+        (Header _ _ sn _) = hdr
+        encodedSeq = encodeWord64 $ if isDTLS ver then sn else msSequence $ stMacState tstate
 
         (macF, msg)
             | ver < TLS10 = (macSSL hashA, B.concat [ encodedSeq, encodeHeaderNoVer hdr, content ])
-            | otherwise   = (hmac hashA, B.concat [ encodedSeq, encodeHeader hdr, content ])
+            | otherwise   = (hmac hashA, B.concat [ encodedSeq, encodeHeaderMAC hdr, content ])
 
 makeDigest :: Header -> ByteString -> RecordM ByteString
 makeDigest hdr content = do

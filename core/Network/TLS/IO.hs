@@ -60,6 +60,19 @@ readExact ctx sz = do
                     else Error_Packet ("partial packet: expecting " ++ show sz ++ " bytes, got: " ++ show (B.length hdrbs))
 
 
+
+-- Read out the bytes necessary for Header deserialization.
+-- This depends on version (5 bytes for TLS, plus 8 more bytes for DTLS).
+readHeaderBytes :: Context -> IO (Either TLSError ByteString)
+readHeaderBytes ctx = do
+  eb <- readExact ctx 5
+  case eb of
+    Left _ -> return eb
+    Right b -> let verMajor = b `B.index` 1
+               in if verMajor /= 254 -- non DTLS record
+                  then return eb
+                  else liftM (mappend b) <$> readExact ctx 8
+
 -- | recvRecord receive a full TLS record (header + data), from the other side.
 --
 -- The record is disengaged from the record layer
@@ -70,11 +83,10 @@ recvRecord compatSSLv2 ctx
 #ifdef SSLV2_COMPATIBLE
     | compatSSLv2 = readExact ctx 2 >>= either (return . Left) sslv2Header
 #endif
-    | otherwise = readExact ctx 5 >>= either (return . Left) (recvLengthE . decodeHeader)
-
+    | otherwise = readHeaderBytes ctx >>= either (return . Left) (recvLengthE . decodeHeader)
         where recvLengthE = either (return . Left) recvLength
 
-              recvLength header@(Header _ _ readlen)
+              recvLength header@(Header _ _ _ readlen)
                 | readlen > 16384 + 2048 = return $ Left maximumSizeExceeded
                 | otherwise              =
                     readExact ctx (fromIntegral readlen) >>=
@@ -102,8 +114,27 @@ recvRecord compatSSLv2 ctx
                     runRxState ctx $ disengageRecord $ rawToRecord header (fragmentCiphertext content)
 
 isCCS :: Record a -> Bool
-isCCS (Record ProtocolType_ChangeCipherSpec _ _) = True
-isCCS _                                          = False
+isCCS (Record ProtocolType_ChangeCipherSpec _ _ _) = True
+isCCS _                                            = False
+
+-- Receive records and pass them through cache/replay window/reorder procedures (in case of DTLS)
+recvRecordCacheAware :: Bool -> Context -> IO (Either TLSError (Record Plaintext))
+recvRecordCacheAware sslv2 ctx = do
+  mr <- ctxRecordCache ctx Nothing
+  case mr of
+    Just r -> return $ Right r
+    Nothing -> do
+      er <- recvRecord sslv2 ctx
+      case er of
+        Left _ -> return er
+        Right r@(Record _ ver _ _) -> 
+          if not $ isDTLS ver
+          then return er
+          else do
+            mr' <- ctxRecordCache ctx $ Just r
+            case mr' of
+              Just r' -> return $ Right r'
+              Nothing -> recvRecordCacheAware sslv2 ctx
 
 -- | receive one packet from the context that contains 1 or
 -- many messages (many only in case of handshake). if will returns a
@@ -111,7 +142,7 @@ isCCS _                                          = False
 recvPacket :: MonadIO m => Context -> m (Either TLSError Packet)
 recvPacket ctx = liftIO $ do
     compatSSLv2 <- ctxHasSSLv2ClientHello ctx
-    erecord     <- recvRecord compatSSLv2 ctx
+    erecord     <- recvRecordCacheAware compatSSLv2 ctx
     case erecord of
         Left err     -> return $ Left err
         Right record -> do
@@ -132,8 +163,8 @@ recvPacket ctx = liftIO $ do
                 return pkt
 
 -- | Send one packet to the context
-sendPacket :: MonadIO m => Context -> Packet -> m ()
-sendPacket ctx pkt = do
+sendPacketTLS :: MonadIO m => Context -> Packet -> m ()
+sendPacketTLS ctx pkt = do
     -- in ver <= TLS1.0, block ciphers using CBC are using CBC residue as IV, which can be guessed
     -- by an attacker. Hence, an empty packet is sent before a normal data packet, to
     -- prevent guessability.
@@ -148,6 +179,22 @@ sendPacket ctx pkt = do
         Right dataToSend -> sendBytes ctx dataToSend
   where isNonNullAppData (AppData b) = not $ B.null b
         isNonNullAppData _           = False
+
+sendPacketDTLS :: MonadIO m => Context -> Packet -> m ()
+sendPacketDTLS ctx pkt = do
+    edataToSend <- liftIO $ do
+                        withLog ctx $ \logging -> loggingPacketSent logging (show pkt)
+                        writePacketDTLS ctx pkt
+    case edataToSend of
+        Left err         -> throwCore err
+        Right dataToSend -> mapM_ (sendBytes ctx) dataToSend
+
+sendPacket :: MonadIO m => Context -> Packet -> m ()
+sendPacket ctx pkt =
+  if ctxIsDTLS ctx
+  then sendPacketDTLS ctx pkt
+  else sendPacketTLS ctx pkt
+
 
 sendPacket13 :: MonadIO m => Context -> Packet13 -> m ()
 sendPacket13 ctx pkt = writePacketBytes13 ctx pkt >>= sendBytes ctx
@@ -168,7 +215,7 @@ recvRecord13 :: Context
             -> IO (Either TLSError Record13)
 recvRecord13 ctx = readExact ctx 5 >>= either (return . Left) (recvLengthE . decodeHeader)
   where recvLengthE = either (return . Left) recvLength
-        recvLength header@(Header _ _ readlen)
+        recvLength header@(Header _ _ _ readlen)
           | readlen > 16384 + 2048 = return $ Left maximumSizeExceeded
           | otherwise              =
               readExact ctx (fromIntegral readlen) >>=

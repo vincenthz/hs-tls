@@ -82,7 +82,10 @@ handshakeServer sparams ctx = liftIO $ do
 --      -> finish             <- finish
 --
 handshakeServerWith :: ServerParams -> Context -> Handshake -> IO ()
-handshakeServerWith sparams ctx clientHello@(ClientHello clientVersion _ clientSession ciphers compressions exts _) = do
+-- there is a call for processHanshake in here, therefore we preserve DtlsHanshake decorator
+-- and even more, mock it up for the non-dtls implementations to avoid code duplication
+handshakeServerWith sparams ctx clientHello@(ClientHello {}) = handshakeServerWith sparams ctx (DtlsHandshake 0 clientHello)
+handshakeServerWith sparams ctx clientHello@(DtlsHandshake _ (ClientHello clientVersion _ clientSession _ ciphers compressions exts _)) = guardDTLSHello sparams ctx clientHello $ do
     established <- ctxEstablished ctx
     -- renego is not allowed in TLS 1.3
     when (established /= NotEstablished) $ do
@@ -100,7 +103,6 @@ handshakeServerWith sparams ctx clientHello@(ClientHello clientVersion _ clientS
 
     -- Handle Client hello
     processHandshake ctx clientHello
-
     -- rejecting SSL2. RFC 6176
     when (clientVersion == SSL2) $ throwCore $ Error_Protocol ("SSL 2.0 is not supported", True, ProtocolVersion)
     -- rejecting SSL3. RFC 7568
@@ -145,7 +147,7 @@ handshakeServerWith sparams ctx clientHello@(ClientHello clientVersion _ clientS
     let allCreds = extraCreds `mappend` sharedCredentials (ctxShared ctx)
 
     -- TLS version dependent
-    if chosenVersion <= TLS12 then
+    if chosenVersion < TLS13 then
         handshakeServerWithTLS12 sparams ctx chosenVersion allCreds exts ciphers serverName clientVersion compressions clientSession
       else do
         mapM_ ensureNullCompression compressions
@@ -207,9 +209,10 @@ handshakeServerWithTLS12 sparams ctx chosenVersion allCreds exts ciphers serverN
         cipherAllowed cipher   = cipherAllowedForVersion chosenVersion cipher && hasCommonGroup cipher
         selectCipher credentials signatureCredentials = filter cipherAllowed (commonCiphers credentials signatureCredentials)
 
+        isXTLS12 = chosenVersion `elem` [TLS12, DTLS12]
         (creds, signatureCreds, ciphersFilteredVersion)
-            = case chosenVersion of
-                  TLS12 -> let -- Build a list of all hash/signature algorithms in common between
+            = case isXTLS12 of
+                  True  -> let -- Build a list of all hash/signature algorithms in common between
                                -- client and server.
                                possibleHashSigAlgs = hashAndSignaturesInCommon ctx exts
 
@@ -437,8 +440,9 @@ doHandshake sparams mcred ctx chosenVersion usedCipher usedCompression clientSes
         -- not called.
         decideHashSig sigAlg = do
             usedVersion <- usingState_ ctx getVersion
-            case usedVersion of
-              TLS12 -> do
+            let isXTLS12 = usedVersion `elem` [TLS12, DTLS12]
+            case isXTLS12 of
+              True  -> do
                   let hashSigs = hashAndSignaturesInCommon ctx exts
                   case filter (sigAlg `signatureCompatible`) hashSigs of
                       []  -> error ("no hash signature for " ++ show sigAlg)
@@ -490,7 +494,7 @@ doHandshake sparams mcred ctx chosenVersion usedCipher usedCompression clientSes
 --      <- finish
 --
 recvClientData :: ServerParams -> Context -> IO ()
-recvClientData sparams ctx = runRecvState ctx (RecvStateHandshake processClientCertificate)
+recvClientData sparams ctx = runRecvState ctx (RecvStateHandshake (processClientCertificate . unDtlsHandshake))
   where processClientCertificate (Certificates certs) = do
             clientCertificate sparams ctx certs
 
@@ -510,9 +514,7 @@ recvClientData sparams ctx = runRecvState ctx (RecvStateHandshake processClientC
         -- Check whether the client correctly signed the handshake.
         -- If not, ask the application on how to proceed.
         --
-        processCertificateVerify (Handshake [hs@(CertVerify dsig)]) = do
-            processHandshake ctx hs
-
+        processCertificateVerifyCompl dsig = do
             certs <- checkValidClientCertChain ctx "change cipher message expected"
 
             usedVersion <- usingState_ ctx getVersion
@@ -524,6 +526,14 @@ recvClientData sparams ctx = runRecvState ctx (RecvStateHandshake processClientC
             verif <- checkCertificateVerify ctx usedVersion sigAlgExpected msgs dsig
             clientCertVerify sparams ctx certs verif
             return $ RecvStateNext expectChangeCipher
+
+        processCertificateVerify (Handshake [hs@(DtlsHandshake _ (CertVerify dsig))]) = do
+            processHandshake ctx hs
+            processCertificateVerifyCompl dsig
+
+        processCertificateVerify (Handshake [hs@(CertVerify dsig)]) = do
+            processHandshake ctx hs
+            processCertificateVerifyCompl dsig
 
         processCertificateVerify p = do
             chain <- usingHState ctx getClientCertChain
@@ -544,6 +554,7 @@ recvClientData sparams ctx = runRecvState ctx (RecvStateHandshake processClientC
 
         expectChangeCipher p                = unexpected (show p) (Just "change cipher")
 
+        expectFinish (DtlsHandshake _ (Finished _)) = return RecvStateDone
         expectFinish (Finished _) = return RecvStateDone
         expectFinish p            = unexpected (show p) (Just "Handshake Finished")
 
@@ -1083,3 +1094,21 @@ clientCertVerify sparams ctx certs verif = do
                 -- chain to the context.
                 usingState_ ctx $ setClientCertificateChain certs
                 else decryptError "verification failed"
+
+guardDTLSHello :: ServerParams -> Context -> Handshake -> IO () -> IO ()
+guardDTLSHello sparams ctx clientHello@(DtlsHandshake _ (ClientHello cver _ _ cookie _ _ _ _)) handshakeActions =
+    if isDTLS cver
+    then if cookie == HelloCookie B.empty
+         then do processHandshake ctx clientHello
+                 cookie' <- ctxHelloCookieGen ctx
+                 sendPacket ctx $ Handshake [HelloVerifyRequest DTLS10 cookie']
+                 hss <- recvPacketHandshake ctx
+                 case hss of
+                   [ch] -> handshakeServerWith sparams ctx ch
+                   _    -> fail ("unexpected handshake received, excepting client hello and received " ++ show hss)
+         else do verified <- ctxHelloCookieVerify ctx cookie
+                 if verified
+                   then handshakeActions
+                   else fail "HelloVerify mechanism failed (cookie verification failed)"
+    else handshakeActions
+guardDTLSHello _ _ _ _ = error "guardDTLSHello should only be called on DTLS ClientHello handshake messages"

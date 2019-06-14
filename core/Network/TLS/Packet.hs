@@ -17,7 +17,8 @@ module Network.TLS.Packet
     , decodeHeader
     , decodeDeprecatedHeaderLength
     , decodeDeprecatedHeader
-    , encodeHeader
+    , encodeHeader -- for serialization
+    , encodeHeaderMAC -- for MAC computation
     , encodeHeaderNoVer -- use for SSL3
 
     -- * marshall functions for alert messages
@@ -27,10 +28,12 @@ module Network.TLS.Packet
 
     -- * marshall functions for handshake messages
     , decodeHandshakeRecord
+    , decodeHandshakeRecordsDTLS
     , decodeHandshake
     , decodeDeprecatedHandshake
     , encodeHandshake
     , encodeHandshakes
+    , encodeHandshakeDTLS
     , encodeHandshakeHeader
     , encodeHandshakeContent
 
@@ -128,7 +131,14 @@ getHandshakeType = do
  - decode and encode headers
  -}
 decodeHeader :: ByteString -> Either TLSError Header
-decodeHeader = runGetErr "header" $ Header <$> getHeaderType <*> getVersion <*> getWord16
+decodeHeader = runGetErr "header" $ do
+  pt <- getHeaderType
+  ver <- getVersion
+  sn <- if isDTLS ver
+        then getWord64
+        else return 0
+  len <- getWord16
+  return $ Header pt ver sn len
 
 decodeDeprecatedHeaderLength :: ByteString -> Either TLSError Word16
 decodeDeprecatedHeaderLength = runGetErr "deprecatedheaderlength" $ subtract 0x8000 <$> getWord16
@@ -138,14 +148,23 @@ decodeDeprecatedHeader size =
     runGetErr "deprecatedheader" $ do
         1 <- getWord8
         version <- getVersion
-        return $ Header ProtocolType_DeprecatedHandshake version size
+        return $ Header ProtocolType_DeprecatedHandshake version 0 size
 
 encodeHeader :: Header -> ByteString
-encodeHeader (Header pt ver len) = runPut (putHeaderType pt >> putBinaryVersion ver >> putWord16 len)
+encodeHeader (Header pt ver sn len) = runPut (putHeaderType pt >>
+                                              putBinaryVersion ver >>
+                                              (when (isDTLS ver) $ putWord64 sn) >>
+                                              putWord16 len)
+        {- FIXME check len <= 2^14 -}
+
+encodeHeaderMAC :: Header -> ByteString
+encodeHeaderMAC (Header pt ver _ len) = runPut (putHeaderType pt >>
+                                                putBinaryVersion ver >>
+                                                putWord16 len)
         {- FIXME check len <= 2^14 -}
 
 encodeHeaderNoVer :: Header -> ByteString
-encodeHeaderNoVer (Header pt _ len) = runPut (putHeaderType pt >> putWord16 len)
+encodeHeaderNoVer (Header pt _ _ len) = runPut (putHeaderType pt >> putWord16 len)
         {- FIXME check len <= 2^14 -}
 
 {-
@@ -173,16 +192,66 @@ encodeAlerts l = runPut $ mapM_ encodeAlert l
   where encodeAlert (al, ad) = putWord8 (valOfType al) >> putWord8 (valOfType ad)
 
 {- decode and encode HANDSHAKE -}
-decodeHandshakeRecord :: ByteString -> GetResult (HandshakeType, ByteString)
+decodeHandshakeRecord :: ByteString -> GetResult (HandshakeType, Handshake -> Handshake, ByteString)
 decodeHandshakeRecord = runGet "handshake-record" $ do
     ty      <- getHandshakeType
     content <- getOpaque24
-    return (ty, content)
+    return (ty, id, content)
+
+
+-- DTLS-related context for handshake message reassembly.
+data HandshakeReassembleCtx = HandshakeReassembleCtx {
+    hrcHandshakeType :: HandshakeType,
+    hrcMessageSeq :: Word16,
+    hrcLengthExpected :: Int,
+    hrcReadyData :: ByteString }
+
+-- Assumes the records on the input are already properly reordered.
+decodeHandshakeRecordsDTLS :: ByteString -> GetResult (HandshakeType, Handshake -> Handshake, ByteString)
+decodeHandshakeRecordsDTLS =
+  let getFragment = do
+        ty      <- getHandshakeType
+        len     <- getWord24
+        msgSeq  <- getWord16
+        fragOff <- getWord24
+        fragLen <- getWord24
+        content <- getBytes fragLen
+        return (ty, len, msgSeq, fragOff, fragLen, content)
+      processFragment mhrc = do
+        (ty, len, msgSeq, fragOff, fragLen, content) <- getFragment
+        case mhrc of
+          Nothing -> if 0 == fragOff
+                     then if len == fragLen
+                          then return (ty, DtlsHandshake msgSeq, content)
+                          else processFragment $ Just $ HandshakeReassembleCtx ty msgSeq len content
+                     else fail $ "Got a fragment of non-zero offset. "++
+                          "Reassemble expects fragments to be reordered at record layer"
+          Just hrc -> do
+            let ready = hrcReadyData hrc
+            when (hrcHandshakeType hrc /= ty) $
+              fail "Handshake type does not match in a subsequent handshake fragment"
+            when (hrcLengthExpected hrc /= len) $
+              fail "Expected message length does not match in a subsequent handshake"
+            when (hrcMessageSeq hrc /= msgSeq) $
+              fail "Handshake message sequence number does not match in subsequent fragment"
+            when (fragOff > B.length ready) $
+              fail "Some handshake fragment is missing, reassemly not possible"
+            when (fragOff < B.length ready) $
+              fail "Handshake fragment overlaps with previously received data"
+            when (fragOff+fragLen > hrcLengthExpected hrc) $
+              fail "Excessive length of handshake fragment"
+            let hrc' = hrc { hrcReadyData = ready `mappend` content }
+            if B.length (hrcReadyData hrc') < hrcLengthExpected hrc'
+              then processFragment $ Just hrc'
+              else return (hrcHandshakeType hrc', DtlsHandshake msgSeq, hrcReadyData hrc')
+  in runGet "handshake-record-dtls" $ processFragment Nothing
+
 
 decodeHandshake :: CurrentParams -> HandshakeType -> ByteString -> Either TLSError Handshake
 decodeHandshake cp ty = runGetErr ("handshake[" ++ show ty ++ "]") $ case ty of
     HandshakeType_HelloRequest    -> decodeHelloRequest
     HandshakeType_ClientHello     -> decodeClientHello
+    HandshakeType_HelloVerifyRequest -> decodeHelloVerifyRequest
     HandshakeType_ServerHello     -> decodeServerHello
     HandshakeType_Certificate     -> decodeCertificates
     HandshakeType_ServerKeyXchg   -> decodeServerKeyXchg cp
@@ -204,7 +273,8 @@ decodeDeprecatedHandshake b = runGetErr "deprecatedhandshake" getDeprecated b
             session <- getSessionId sessionIdLen
             random <- getChallenge challengeLen
             let compressions = [0]
-            return $ ClientHello ver random session ciphers compressions [] (Just b)
+                cookie = HelloCookie B.empty
+            return $ ClientHello ver random session cookie ciphers compressions [] (Just b)
         getCipherSpec len | len < 3 = return []
         getCipherSpec len = do
             [c0,c1,c2] <- map fromEnum <$> replicateM 3 getWord8
@@ -222,13 +292,20 @@ decodeClientHello = do
     ver          <- getVersion
     random       <- getClientRandom32
     session      <- getSession
+    cookie       <- if isDTLS ver
+                    then getHelloCookie
+                    else return $ HelloCookie B.empty
     ciphers      <- getWords16
     compressions <- getWords8
     r            <- remaining
     exts <- if hasHelloExtensions ver && r > 0
             then fromIntegral <$> getWord16 >>= getExtensions
             else return []
-    return $ ClientHello ver random session ciphers compressions exts Nothing
+    return $ ClientHello ver random session cookie ciphers compressions exts Nothing
+
+decodeHelloVerifyRequest :: Get Handshake
+decodeHelloVerifyRequest = HelloVerifyRequest <$> getVersion <*> getHelloCookie
+    
 
 decodeServerHello :: Get Handshake
 decodeServerHello = do
@@ -351,9 +428,24 @@ encodeHandshake o =
     let content = runPut $ encodeHandshakeContent o in
     let len = B.length content in
     let header = case o of
-                    ClientHello _ _ _ _ _ _ (Just _) -> "" -- SSLv2 ClientHello message
+                    ClientHello _ _ _ _ _ _ _ (Just _) -> "" -- SSLv2 ClientHello message
                     _ -> runPut $ encodeHandshakeHeader (typeOfHandshake o) len in
     B.concat [ header, content ]
+
+encodeHandshakeDTLS :: Word16 -> Handshake -> [ByteString]
+encodeHandshakeDTLS mtu (DtlsHandshake messageSeq o) =
+    let content = runPut $ encodeHandshakeContent o
+        len = B.length content
+        ty = typeOfHandshake o
+        encodeFragments bs fragOffset =
+          let (frag, rest) = B.splitAt (fromIntegral mtu) bs
+              fragLength = B.length frag
+              header = runPut $ encodeHandshakeHeaderDTLS ty len messageSeq fragOffset fragLength
+          in (header `mappend` frag : if B.null rest
+                                      then []
+                                      else encodeFragments rest (fragOffset+fragLength))
+    in encodeFragments content 0
+encodeHandshakeDTLS _ h = error $ "encodeHandshakeDTLS called for a non-dtls hanshake message "++(show h)
 
 encodeHandshakes :: [Handshake] -> ByteString
 encodeHandshakes hss = B.concat $ map encodeHandshake hss
@@ -361,17 +453,31 @@ encodeHandshakes hss = B.concat $ map encodeHandshake hss
 encodeHandshakeHeader :: HandshakeType -> Int -> Put
 encodeHandshakeHeader ty len = putWord8 (valOfType ty) >> putWord24 len
 
-encodeHandshakeContent :: Handshake -> Put
+encodeHandshakeHeaderDTLS :: HandshakeType -> Int -> Word16 -> Int -> Int -> Put
+encodeHandshakeHeaderDTLS ty len messageSeq fragOffset fragLength = do
+    putWord8 (valOfType ty)
+    putWord24 len
+    putWord16 messageSeq
+    putWord24 fragOffset
+    putWord24 fragLength
 
-encodeHandshakeContent (ClientHello _ _ _ _ _ _ (Just deprecated)) = do
+encodeHandshakeContent :: Handshake -> Put
+encodeHandshakeContent (ClientHello _ _ _ _ _ _ _ (Just deprecated)) = do
     putBytes deprecated
-encodeHandshakeContent (ClientHello version random session cipherIDs compressionIDs exts Nothing) = do
+
+encodeHandshakeContent (ClientHello version random session cookie cipherIDs compressionIDs exts Nothing) = do
     putBinaryVersion version
     putClientRandom32 random
     putSession session
+    when (isDTLS version) $ putHelloCookie cookie
     putWords16 cipherIDs
     putWords8 compressionIDs
     putExtensions exts
+    return ()
+
+encodeHandshakeContent (HelloVerifyRequest version cookie) = do
+    putBinaryVersion version
+    putHelloCookie cookie
     return ()
 
 encodeHandshakeContent (ServerHello version random session cipherid compressionID exts) = do
@@ -417,6 +523,8 @@ encodeHandshakeContent (CertVerify digitallySigned) = putDigitallySigned digital
 
 encodeHandshakeContent (Finished opaque) = putBytes opaque
 
+encodeHandshakeContent (DtlsHandshake _ hs) = encodeHandshakeContent hs
+
 ------------------------------------------------------------
 
 -- | Encode a list of distinguished names.
@@ -456,9 +564,15 @@ getSession = do
         0   -> return $ Session Nothing
         len -> Session . Just <$> getBytes len
 
+getHelloCookie :: Get HelloCookie
+getHelloCookie = HelloCookie <$> getOpaque8
+
 putSession :: Session -> Put
 putSession (Session Nothing)  = putWord8 0
 putSession (Session (Just s)) = putOpaque8 s
+
+putHelloCookie :: HelloCookie -> Put
+putHelloCookie (HelloCookie c) = putOpaque8 c
 
 getExtensions :: Int -> Get [ExtensionRaw]
 getExtensions 0   = return []
